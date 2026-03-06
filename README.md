@@ -1,48 +1,98 @@
 # Business Card Service
 
-Backend API for the Business Card frontend. Stores and serves contact info (name, phone).
+FastAPI backend for the Business Card frontend. Stores contacts in Azure SQL Database.
 
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/contact` | Returns stored name and phone |
-| POST | `/api/contact` | Saves name and phone (JSON: `{ "name": "...", "phone": "..." }`) |
+| GET | `/api/contact` | Returns most recent contact |
+| POST | `/api/contact` | Saves a new contact |
+| POST | `/api/seed` | Seeds 20 random contacts |
 | GET | `/api/health` | Health check |
 
-## Connect Frontend + Backend
+## Environment Variables
 
-The frontend lives in the **bussiness-card** repo (sibling folder). To run both together:
+```
+DB_SERVER=your-server.database.windows.net
+DB_NAME=your-database
+DB_USER=your-username
+DB_PASSWORD=your-password
+DB_PORT=1433  # optional, default 1433
+```
 
-### 1. Start the backend (this repo)
+## Run Locally
 
 ```bash
-cd backend
-python -m venv venv
-source venv/bin/activate   # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Backend runs at **http://localhost:8000**
+## Docker
 
-### 2. Start the frontend (bussiness-card repo)
+### Build
 
 ```bash
-cd ../bussiness-card
-cp .env.example .env.local   # Optional: API URL defaults to http://localhost:8000
-npm install
-npm run dev
+docker build -t business-card-api .
 ```
 
-Frontend runs at **http://localhost:3000**
+### Run locally
 
-### 3. Use the app
+```bash
+docker run -p 8000:8000 \
+  -e DB_SERVER=your-server.database.windows.net \
+  -e DB_NAME=your-database \
+  -e DB_USER=your-username \
+  -e DB_PASSWORD=your-password \
+  business-card-api
+```
 
-1. Open **http://localhost:3000** in your browser
-2. Enter name and phone – they are saved to the backend
-3. Refresh the page – data from the backend appears
+## Push to AWS ECR
 
-## Environment
+### 1. Install and configure AWS CLI
 
-- **Frontend**: Set `NEXT_PUBLIC_API_URL=http://localhost:8000` in `.env.local` if the backend uses a different URL.
+```bash
+aws configure
+# Enter your AWS Access Key, Secret Key, region (e.g. us-east-1)
+```
+
+### 2. Create ECR repository (if not exists)
+
+```bash
+aws ecr create-repository --repository-name business-card-api --region us-east-1
+```
+
+### 3. Authenticate Docker to ECR
+
+```bash
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
+```
+
+Replace `<account-id>` with your AWS account ID (e.g. `123456789012`).
+
+### 4. Build and tag
+
+```bash
+# Get your ECR registry URI from AWS Console or:
+aws ecr describe-repositories --repository-names business-card-api --query 'repositories[0].repositoryUri' --output text
+
+# Build and tag (replace <account-id> and <region>)
+docker build -t business-card-api .
+docker tag business-card-api:latest <account-id>.dkr.ecr.<region>.amazonaws.com/business-card-api:latest
+```
+
+### 5. Push to ECR
+
+```bash
+docker push <account-id>.dkr.ecr.<region>.amazonaws.com/business-card-api:latest
+```
+
+### One-liner (after AWS CLI is configured)
+
+```bash
+ECR_URI=$(aws ecr describe-repositories --repository-names business-card-api --query 'repositories[0].repositoryUri' --output text 2>/dev/null || aws ecr create-repository --repository-name business-card-api --query 'repository.repositoryUri' --output text)
+docker build -t business-card-api .
+docker tag business-card-api:latest $ECR_URI:latest
+aws ecr get-login-password | docker login --username AWS --password-stdin ${ECR_URI%/*}
+docker push $ECR_URI:latest
+```
