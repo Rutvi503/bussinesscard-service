@@ -1,9 +1,14 @@
+import io
 import logging
+import os
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException
+import qrcode
+from fastapi import Depends, File, FastAPI, HTTPException, UploadFile
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import random
@@ -13,12 +18,14 @@ from database import (
     create_profile as db_create_profile,
     create_user as db_create_user,
     get_contact as db_get_contact,
+    get_profile_by_slug,
     get_profile_by_user_id,
     get_user_by_email,
     get_user_by_id,
     save_contact as db_save_contact,
     seed_contacts,
     update_profile as db_update_profile,
+    update_profile_picture,
     update_user_password,
 )
 from models import ChangePassword, ProfileCreate, ProfileUpdate, UserLogin, UserRegister
@@ -55,6 +62,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Business Card API")
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+# Create uploads directory if it doesn't exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Serve uploaded files (must be before routes that might conflict)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Allow frontend (Next.js on port 3000) to call this API
 app.add_middleware(
@@ -160,6 +178,131 @@ def update_profile(data: ProfileUpdate, user: tuple[int, str] = Depends(get_curr
     db_update_profile(user_id, **fields)
     profile = get_profile_by_user_id(user_id)
     return profile
+
+
+@app.post("/api/profile/picture")
+async def upload_profile_picture(
+    file: UploadFile = File(...),
+    user: tuple[int, str] = Depends(get_current_user),
+):
+    """
+    Upload profile picture. Requires valid JWT and existing profile.
+    Accepts: jpg, jpeg, png, webp. Max 5 MB.
+    """
+    user_id, _ = user
+    profile = get_profile_by_user_id(user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found. Create one first.")
+
+    # Validate file extension
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
+        )
+
+    # Read and validate file size
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large. Max 5 MB.")
+
+    # Save file: user_id_timestamp.ext (e.g. 1_1709820000.jpg)
+    filename = f"{user_id}_{uuid.uuid4().hex[:8]}{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    with open(filepath, "wb") as f:
+        f.write(content)
+
+    # Store URL path in database (e.g. /uploads/1_abc123.jpg)
+    url_path = f"/uploads/{filename}"
+    update_profile_picture(user_id, url_path)
+
+    return {"profile_picture_url": url_path}
+
+
+# --- Public card (no auth - for QR scan) ---
+
+@app.get("/api/card/{slug}")
+def get_public_card(slug: str):
+    """
+    Get business card by slug. No auth required.
+    Used when someone scans the QR code - returns full profile for display/save.
+    """
+    profile = get_profile_by_slug(slug)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Card not found")
+    return profile
+
+
+@app.get("/api/card/{slug}/vcard")
+def get_vcard(slug: str):
+    """
+    Download vCard (.vcf) for business card. No auth required.
+    Scan QR → open card page → tap 'Save to contacts' → this endpoint.
+    """
+    profile = get_profile_by_slug(slug)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    def vcard_escape(s: str | None) -> str:
+        if not s:
+            return ""
+        return s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+    full_name = profile.get("full_name") or "Contact"
+    parts = full_name.strip().split(maxsplit=1)
+    given = parts[0] if parts else ""
+    family = parts[1] if len(parts) > 1 else ""
+
+    lines = [
+        "BEGIN:VCARD",
+        "VERSION:3.0",
+        f"FN:{vcard_escape(full_name)}",
+        f"N:{vcard_escape(family)};{vcard_escape(given)};;;",
+    ]
+    if profile.get("phone"):
+        lines.append(f"TEL;TYPE=CELL:{vcard_escape(profile['phone'])}")
+    if profile.get("email"):
+        lines.append(f"EMAIL:{vcard_escape(profile['email'])}")
+    if profile.get("company_name"):
+        lines.append(f"ORG:{vcard_escape(profile['company_name'])}")
+    if profile.get("job_title"):
+        lines.append(f"TITLE:{vcard_escape(profile['job_title'])}")
+    if profile.get("website"):
+        lines.append(f"URL:{vcard_escape(profile['website'])}")
+    if profile.get("address"):
+        lines.append(f"ADR;TYPE=WORK:;;{vcard_escape(profile['address'])};;;;")
+    if profile.get("bio"):
+        lines.append(f"NOTE:{vcard_escape(profile['bio'])}")
+    lines.append("END:VCARD")
+
+    vcard_content = "\r\n".join(lines)
+    filename = f"{full_name.replace(' ', '_')}.vcf" if full_name else "contact.vcf"
+    return Response(
+        content=vcard_content,
+        media_type="text/vcard",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/qr")
+def get_qr_code(user: tuple[int, str] = Depends(get_current_user)):
+    """
+    Generate QR code image for current user's business card.
+    QR encodes: {BASE_URL}/api/card/{slug}
+    Returns PNG image. Requires valid JWT and existing profile.
+    """
+    user_id, _ = user
+    profile = get_profile_by_user_id(user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found. Create one first.")
+    slug = profile["slug"]
+    card_url = f"{BASE_URL.rstrip('/')}/api/card/{slug}"
+    img = qrcode.make(card_url)
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return Response(content=buffer.getvalue(), media_type="image/png")
 
 
 # --- Legacy contact routes ---
